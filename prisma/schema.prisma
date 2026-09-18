@@ -1,0 +1,664 @@
+// Radx IT Help Desk — Prisma schema
+// PostgreSQL. Every model below maps to a model in spec §3.
+//
+// Naming: Prisma models/fields use camelCase; @map/@@map pin the physical
+// snake_case names so the schema stays readable from psql and so a future
+// data migration from the Django original is a straight column match.
+
+// Prisma 7: the client runs on the node-postgres driver adapter with a WASM
+// query compiler — no Rust query engine is loaded at runtime. The connection
+// URL lives in prisma.config.ts (CLI) and in lib/db/prisma.ts (runtime).
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  staff
+  agent
+  admin
+}
+
+enum AssetCategory {
+  laptop
+  desktop
+  phone
+  printer
+  monitor
+  clocking
+  starlink
+  other
+  computer // legacy — retained for old records, hidden from dropdowns (CC-008)
+}
+
+enum AssetStatus {
+  active
+  faulty
+  repair
+  retired
+  spare
+  return_pending
+  stolen
+}
+
+enum CheckinSource {
+  agent
+  manual
+}
+
+enum AssetDocumentType {
+  policy
+  allocation
+  other
+}
+
+enum StaffGroup {
+  staff
+  management
+  consultant
+}
+
+enum TicketStatus {
+  open
+  in_progress
+  waiting
+  resolved
+  closed
+}
+
+enum TicketPriority {
+  low
+  medium
+  high
+  critical
+}
+
+enum NotificationKind {
+  submitted
+  update
+  assigned
+  reply
+  equipment
+  password_reset
+  other
+}
+
+enum NotificationStatus {
+  pending
+  sent
+  failed
+}
+
+enum EquipmentStatus {
+  submitted
+  review
+  approved
+  declined
+  ordered
+  issued
+  hold
+}
+
+enum EquipmentPriority {
+  normal
+  urgent
+}
+
+// ---------------------------------------------------------------------------
+// Accounts
+// ---------------------------------------------------------------------------
+
+model User {
+  id           Int       @id @default(autoincrement())
+  username     String    @unique
+  email        String    @unique
+  firstName    String    @default("") @map("first_name")
+  lastName     String    @default("") @map("last_name")
+  passwordHash String    @map("password_hash")
+  isActive     Boolean   @default(true) @map("is_active")
+  isStaff      Boolean   @default(false) @map("is_staff")
+  isSuperuser  Boolean   @default(false) @map("is_superuser")
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  profile             UserProfile?
+  sessions            Session[]
+  passwordResetTokens PasswordResetToken[]
+  employee            Employee?
+
+  // Reverse relations
+  createdTickets      Ticket[]           @relation("TicketCreatedBy")
+  assignedTickets     Ticket[]           @relation("TicketAssignedTo")
+  deletedTickets      Ticket[]           @relation("TicketDeletedBy")
+  assignedAssets      Asset[]            @relation("AssetAssignedUser")
+  deletedAssets       Asset[]            @relation("AssetDeletedBy")
+  deletedEmployees    Employee[]         @relation("EmployeeDeletedBy")
+  deletedRequests     EquipmentRequest[] @relation("EquipmentDeletedBy")
+  decidedRequests     EquipmentRequest[] @relation("EquipmentDecidedBy")
+  comments            Comment[]
+  uploadedAttachments TicketAttachment[]
+  uploadedDocuments   AssetDocument[]
+  auditEvents         AuditLog[]
+
+  @@index([isActive])
+  @@map("auth_user")
+}
+
+model UserProfile {
+  id         Int     @id @default(autoincrement())
+  userId     Int     @unique @map("user_id")
+  role       Role    @default(staff)
+  /// Country code (ZW | MZ | GR | NA | ALL). Labelled "Country" in the UI — spec note 5.
+  site       String  @default("ZW")
+  department String  @default("")
+  phone      String  @default("")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([role])
+  @@map("accounts_userprofile")
+}
+
+/// DB-backed session (CC-001). Only the SHA-256 digest of the token is stored.
+model Session {
+  id         String   @id @default(cuid())
+  tokenHash  String   @unique @map("token_hash")
+  userId     Int      @map("user_id")
+  expiresAt  DateTime @map("expires_at")
+  lastSeenAt DateTime @default(now()) @map("last_seen_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("accounts_session")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique @map("token_hash")
+  userId    Int       @map("user_id")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  ipAddress String?   @map("ip_address")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("accounts_passwordresettoken")
+}
+
+/// Security audit trail (instruction §27). Never contains secrets.
+model AuditLog {
+  id        BigInt   @id @default(autoincrement())
+  event     String
+  actorId   Int?     @map("actor_id")
+  actorRepr String   @default("") @map("actor_repr")
+  target    String   @default("")
+  targetId  String   @default("") @map("target_id")
+  ipAddress String?  @map("ip_address")
+  detail    Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([event, createdAt])
+  @@index([actorId])
+  @@index([target, targetId])
+  @@map("core_auditlog")
+}
+
+// ---------------------------------------------------------------------------
+// Lookup tables
+// ---------------------------------------------------------------------------
+
+model Country {
+  id        Int      @id @default(autoincrement())
+  code      String   @unique
+  name      String
+  isActive  Boolean  @default(true) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([isActive, sortOrder])
+  @@map("core_country")
+}
+
+model Site {
+  id          Int      @id @default(autoincrement())
+  name        String
+  code        String   @default("")
+  /// Country code — FK-like reference to Country.code
+  siteCountry String   @map("site_country")
+  address     String   @default("")
+  notes       String   @default("")
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  assets            Asset[]
+  equipmentRequests EquipmentRequest[]
+
+  @@unique([name, siteCountry])
+  @@index([siteCountry, isActive])
+  @@index([code])
+  @@map("core_site")
+}
+
+model TicketCategory {
+  id        Int      @id @default(autoincrement())
+  name      String
+  slug      String   @unique
+  isActive  Boolean  @default(true) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([isActive, sortOrder])
+  @@map("tickets_ticketcategory")
+}
+
+model EquipmentItemType {
+  id        Int      @id @default(autoincrement())
+  name      String
+  slug      String   @unique
+  isActive  Boolean  @default(true) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([isActive, sortOrder])
+  @@map("equipment_itemtype")
+}
+
+// ---------------------------------------------------------------------------
+// Employees
+// ---------------------------------------------------------------------------
+
+model Employee {
+  id             Int        @id @default(autoincrement())
+  fullName       String     @map("full_name")
+  email          String     @unique
+  phone          String     @default("")
+  department     String     @default("")
+  jobTitle       String     @default("") @map("job_title")
+  /// Country code. Labelled "Country" in the UI — spec note 5.
+  site           String     @default("ZW")
+  employeeNumber String?    @unique @map("employee_number")
+  userId         Int?       @unique @map("user_id")
+  staffGroup     StaffGroup @default(staff) @map("staff_group")
+  altEmail       String     @default("") @map("alt_email")
+  isActive       Boolean    @default(true) @map("is_active")
+  notes          String     @default("")
+
+  /// Fernet ciphertext of a temporary mailbox password. Never logged, never exported.
+  emailPasswordEnc     String?   @map("email_password_enc")
+  emailPasswordSetAt   DateTime? @map("email_password_set_at")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  // Soft delete
+  isDeleted   Boolean   @default(false) @map("is_deleted")
+  deletedAt   DateTime? @map("deleted_at")
+  deletedById Int?      @map("deleted_by_id")
+
+  user      User?  @relation(fields: [userId], references: [id], onDelete: SetNull)
+  deletedBy User?  @relation("EmployeeDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+
+  assets            Asset[]
+  tickets           Ticket[]
+  equipmentRequests EquipmentRequest[]
+
+  @@index([isDeleted, isActive])
+  @@index([site])
+  @@index([department])
+  @@index([staffGroup])
+  @@index([fullName])
+  @@map("core_employee")
+}
+
+// ---------------------------------------------------------------------------
+// Assets
+// ---------------------------------------------------------------------------
+
+model Asset {
+  id       Int           @id @default(autoincrement())
+  /// NULL (never '') when absent, so the unique index permits many untagged assets — spec note 6.
+  assetTag String?       @unique @map("asset_tag")
+  category AssetCategory @default(laptop)
+  brand    String        @default("")
+  model    String        @default("")
+  serialNumber String    @default("") @map("serial_number")
+  status   AssetStatus   @default(active)
+
+  // Assignment — employee XOR site (DB CHECK constraint added in migration)
+  assignedEmployeeId Int?    @map("assigned_employee_id")
+  assignedSiteId     Int?    @map("assigned_site_id")
+  assignedToName     String  @default("") @map("assigned_to_name")
+  assignedToUserId   Int?    @map("assigned_to_user_id")
+  department         String  @default("")
+  /// Country code. Labelled "Country" in the UI — spec note 5.
+  site               String  @default("ZW")
+  /// Physical site name. Labelled "Site" in the UI — spec note 5.
+  location           String  @default("")
+
+  // Category-specific specs
+  macAddress      String @default("") @map("mac_address")
+  osVersion       String @default("") @map("os_version")
+  officeVersion   String @default("") @map("office_version")
+  laptopOrDesktop String @default("") @map("laptop_or_desktop")
+  imei1           String @default("") @map("imei_1")
+  imei2           String @default("") @map("imei_2")
+  cellNumber      String @default("") @map("cell_number")
+  package         String @default("")
+  printerType     String @default("") @map("printer_type")
+  tonerType       String @default("") @map("toner_type")
+  ipAddress       String @default("") @map("ip_address")
+  areaCode        String @default("") @map("area_code")
+
+  // Device location tracking (CC-004: digest + prefix, never the raw key)
+  deviceKeyHash    String?   @map("device_key_hash")
+  deviceKeyPrefix  String?   @map("device_key_prefix")
+  deviceKeySetAt   DateTime? @map("device_key_set_at")
+  trackingEnabled  Boolean   @default(false) @map("tracking_enabled")
+  lastSeenAt       DateTime? @map("last_seen_at")
+  lastSeenLocation String    @default("") @map("last_seen_location")
+
+  acquisitionDate DateTime? @map("acquisition_date") @db.Date
+  notes           String    @default("")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  // Soft delete
+  isDeleted   Boolean   @default(false) @map("is_deleted")
+  deletedAt   DateTime? @map("deleted_at")
+  deletedById Int?      @map("deleted_by_id")
+
+  assignedEmployee Employee? @relation(fields: [assignedEmployeeId], references: [id], onDelete: SetNull)
+  assignedSite     Site?     @relation(fields: [assignedSiteId], references: [id], onDelete: SetNull)
+  assignedToUser   User?     @relation("AssetAssignedUser", fields: [assignedToUserId], references: [id], onDelete: SetNull)
+  deletedBy        User?     @relation("AssetDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+
+  checkins          DeviceCheckin[]
+  documents         AssetDocument[]
+  /// Tickets whose *subject* is this asset — drives the fault count (CC-007)
+  subjectTickets    Ticket[]           @relation("TicketSubjectAsset")
+  /// Tickets this asset is additionally implicated in (CC-007)
+  relatedTickets    Ticket[]           @relation("TicketRelatedAssets")
+  issuedForRequests EquipmentRequest[] @relation("EquipmentIssuedAssets")
+
+  @@index([isDeleted, status])
+  @@index([isDeleted, category])
+  @@index([site])
+  @@index([location])
+  @@index([assignedEmployeeId])
+  @@index([assignedSiteId])
+  @@index([serialNumber])
+  @@index([deviceKeyPrefix])
+  @@index([brand, model])
+  @@map("core_asset")
+}
+
+model DeviceCheckin {
+  id           BigInt        @id @default(autoincrement())
+  assetId      Int           @map("asset_id")
+  reportedAt   DateTime      @default(now()) @map("reported_at")
+  source       CheckinSource @default(agent)
+  hostname     String        @default("")
+  loggedInUser String        @default("") @map("logged_in_user")
+  wifiSsid     String        @default("") @map("wifi_ssid")
+  publicIp     String?       @map("public_ip")
+  geoCity      String        @default("") @map("geo_city")
+  geoRegion    String        @default("") @map("geo_region")
+  geoCountry   String        @default("") @map("geo_country")
+  latitude     Float?
+  longitude    Float?
+  gpsAccuracyM Float?        @map("gps_accuracy_m")
+  agentVersion String        @default("") @map("agent_version")
+  notes        String        @default("")
+
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([assetId, reportedAt])
+  @@map("core_devicecheckin")
+}
+
+model AssetDocument {
+  id           BigInt            @id @default(autoincrement())
+  assetId      Int               @map("asset_id")
+  documentType AssetDocumentType @default(other) @map("document_type")
+  /// Storage key: asset_docs/{assetId}/{randomHex}/{safeFilename}
+  storageKey   String            @map("storage_key")
+  filename     String
+  contentType  String            @default("application/octet-stream") @map("content_type")
+  sizeBytes    Int               @default(0) @map("size_bytes")
+  uploadedById Int?              @map("uploaded_by_id")
+  uploadedAt   DateTime          @default(now()) @map("uploaded_at")
+  notes        String            @default("")
+
+  asset      Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  uploadedBy User? @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  @@index([assetId])
+  @@map("core_assetdocument")
+}
+
+// ---------------------------------------------------------------------------
+// Tickets
+// ---------------------------------------------------------------------------
+
+model Ticket {
+  /// Reference number RDX-{id:0>4} is derived from this sequence — concurrency-safe by construction.
+  id          Int            @id @default(autoincrement())
+  title       String
+  description String
+  status      TicketStatus   @default(open)
+  priority    TicketPriority @default(medium)
+  /// Slug from TicketCategory. Stored as a string so category renames never rewrite tickets.
+  category    String         @default("other")
+  deviceType  String         @default("") @map("device_type")
+  anydeskId   String         @default("") @map("anydesk_id")
+  /// Canonical country code (ZW | MZ | GR | NA | OTHER). ZA is normalised to GR — CC-003.
+  country     String         @default("ZW")
+  siteName    String         @default("") @map("site_name")
+  assetNumber String         @default("") @map("asset_number")
+
+  submitterName  String  @default("") @map("submitter_name")
+  submitterEmail String  @default("") @map("submitter_email")
+  sendCopy       Boolean @default(false) @map("send_copy")
+
+  createdById       Int?    @map("created_by_id")
+  submittedPublicly Boolean @default(false) @map("submitted_publicly")
+  assignedToId      Int?    @map("assigned_to_id")
+  employeeId        Int?    @map("employee_id")
+  assetId           Int?    @map("asset_id")
+  /// Legacy country column retained for data continuity — spec §3.9
+  site              String  @default("")
+
+  dueDate    DateTime? @map("due_date")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  resolvedAt DateTime? @map("resolved_at")
+
+  // Soft delete
+  isDeleted   Boolean   @default(false) @map("is_deleted")
+  deletedAt   DateTime? @map("deleted_at")
+  deletedById Int?      @map("deleted_by_id")
+
+  createdBy  User?     @relation("TicketCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  assignedTo User?     @relation("TicketAssignedTo", fields: [assignedToId], references: [id], onDelete: SetNull)
+  deletedBy  User?     @relation("TicketDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  employee   Employee? @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  asset      Asset?    @relation("TicketSubjectAsset", fields: [assetId], references: [id], onDelete: SetNull)
+  assets     Asset[]   @relation("TicketRelatedAssets")
+
+  comments      Comment[]
+  attachments   TicketAttachment[]
+  notifications Notification[]
+
+  @@index([isDeleted, status])
+  @@index([isDeleted, priority])
+  @@index([isDeleted, createdAt])
+  @@index([category])
+  @@index([country])
+  @@index([assignedToId])
+  @@index([createdById])
+  @@index([employeeId])
+  @@index([assetId])
+  @@index([dueDate])
+  @@index([submitterEmail])
+  @@map("tickets_ticket")
+}
+
+model TicketAttachment {
+  id           BigInt   @id @default(autoincrement())
+  ticketId     Int      @map("ticket_id")
+  /// Storage key: tickets/{ticketId}/{randomHex}/{safeFilename}
+  storageKey   String   @map("storage_key")
+  filename     String
+  contentType  String   @default("application/octet-stream") @map("content_type")
+  sizeBytes    Int      @default(0) @map("size_bytes")
+  uploadedById Int?     @map("uploaded_by_id")
+  uploadedAt   DateTime @default(now()) @map("uploaded_at")
+
+  ticket     Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  uploadedBy User?  @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  @@index([ticketId])
+  @@map("tickets_ticketattachment")
+}
+
+model Comment {
+  id         BigInt   @id @default(autoincrement())
+  ticketId   Int      @map("ticket_id")
+  authorId   Int?     @map("author_id")
+  body       String
+  isInternal Boolean  @default(false) @map("is_internal")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author User?  @relation(fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([ticketId, createdAt])
+  @@map("tickets_comment")
+}
+
+model Notification {
+  id            BigInt             @id @default(autoincrement())
+  ticketId      Int?               @map("ticket_id")
+  kind          NotificationKind   @default(other)
+  recipient     String
+  subject       String
+  body          String
+  /// Comma-separated TicketAttachment IDs to include — spec §3.12
+  attachmentIds String             @default("") @map("attachment_ids")
+  status        NotificationStatus @default(pending)
+  attempts      Int                @default(0)
+  lastError     String             @default("") @map("last_error")
+  createdAt     DateTime           @default(now()) @map("created_at")
+  sentAt        DateTime?          @map("sent_at")
+
+  ticket Ticket? @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@index([ticketId])
+  @@map("tickets_notification")
+}
+
+// ---------------------------------------------------------------------------
+// Equipment requests
+// ---------------------------------------------------------------------------
+
+model EquipmentRequest {
+  id             Int               @id @default(autoincrement())
+  requesterName  String            @map("requester_name")
+  requesterEmail String            @map("requester_email")
+  department     String            @default("")
+  /// Canonical country code (ZW | MZ | GR | NA | OTHER) — CC-003
+  country        String            @default("ZW")
+  siteName       String            @default("") @map("site_name")
+  siteCode       String            @default("") @map("site_code")
+  employeeId     Int?              @map("employee_id")
+  siteId         Int?              @map("site_id")
+  otherEquipment String            @default("") @map("other_equipment")
+  reason         String            @default("")
+  justification  String            @default("")
+  priority       EquipmentPriority @default(normal)
+  sendCopy       Boolean           @default(false) @map("send_copy")
+  status         EquipmentStatus   @default(submitted)
+
+  decidedById  Int?      @map("decided_by_id")
+  decidedAt    DateTime? @map("decided_at")
+  decisionNote String    @default("") @map("decision_note")
+  issuedAt     DateTime? @map("issued_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Soft delete
+  isDeleted   Boolean   @default(false) @map("is_deleted")
+  deletedAt   DateTime? @map("deleted_at")
+  deletedById Int?      @map("deleted_by_id")
+
+  employee     Employee? @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  site         Site?     @relation(fields: [siteId], references: [id], onDelete: SetNull)
+  decidedBy    User?     @relation("EquipmentDecidedBy", fields: [decidedById], references: [id], onDelete: SetNull)
+  deletedBy    User?     @relation("EquipmentDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  issuedAssets Asset[]   @relation("EquipmentIssuedAssets")
+
+  items          RequestedItem[]
+  statusHistory  EquipmentStatusEvent[]
+
+  @@index([isDeleted, status])
+  @@index([isDeleted, createdAt])
+  @@index([country])
+  @@index([requesterEmail])
+  @@index([employeeId])
+  @@map("equipment_request")
+}
+
+model RequestedItem {
+  id        BigInt @id @default(autoincrement())
+  requestId Int    @map("request_id")
+  /// Slug from EquipmentItemType
+  item      String
+  quantity  Int    @default(1)
+
+  request EquipmentRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@unique([requestId, item])
+  @@index([requestId])
+  @@map("equipment_requesteditem")
+}
+
+/// Audit of every accepted status transition — supports the decision timeline on the detail page.
+model EquipmentStatusEvent {
+  id        BigInt          @id @default(autoincrement())
+  requestId Int             @map("request_id")
+  fromStatus EquipmentStatus @map("from_status")
+  toStatus   EquipmentStatus @map("to_status")
+  actorId   Int?            @map("actor_id")
+  actorRepr String          @default("") @map("actor_repr")
+  note      String          @default("")
+  createdAt DateTime        @default(now()) @map("created_at")
+
+  request EquipmentRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([requestId, createdAt])
+  @@map("equipment_statusevent")
+}

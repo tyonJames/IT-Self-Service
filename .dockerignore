@@ -1,0 +1,14 @@
+.git
+.github
+.next
+node_modules
+.storage
+.storage-test
+tests
+docs/*.pdf
+coverage
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store

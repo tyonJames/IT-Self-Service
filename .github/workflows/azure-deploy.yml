@@ -1,0 +1,169 @@
+name: CI · Azure deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Never grant workflow-wide write access — every job asks for exactly the
+# permissions it needs, and no more.
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "20"
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  # ------------------------------------------------------------------
+  # Lint, typecheck, test on a real PostgreSQL. Runs on every push.
+  # ------------------------------------------------------------------
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: radx
+          POSTGRES_PASSWORD: radx
+          POSTGRES_DB: radx_helpdesk_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U radx"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://radx:radx@127.0.0.1:5432/radx_helpdesk_test
+      TEST_DATABASE_URL: postgresql://radx:radx@127.0.0.1:5432/radx_helpdesk_test
+      SECRET_KEY: ci-secret-key-that-is-comfortably-long-enough-for-the-suite
+      FIELD_ENCRYPTION_KEY: ci-field-key-thirty-two-bytes-base64url-encoded__
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Apply database schema
+        run: |
+          for f in prisma/migrations/*/migration.sql; do
+            PGPASSWORD=radx psql -h 127.0.0.1 -U radx -d radx_helpdesk_test -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - run: npx prisma generate
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      - run: npm run test
+
+  # ------------------------------------------------------------------
+  # Build the standalone Next.js bundle. Runs on every push.
+  # ------------------------------------------------------------------
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: Assemble deploy package
+        run: |
+          mkdir -p deploy
+          cp -r .next/standalone/. deploy/
+          mkdir -p deploy/.next
+          cp -r .next/static deploy/.next/static
+          cp -r public deploy/public
+          cp -r prisma deploy/
+          cp -r scripts deploy/
+          cp prisma.config.ts deploy/
+          # Prisma CLI is a runtime dependency of the startup script.
+          mkdir -p deploy/node_modules/prisma deploy/node_modules/@prisma \
+                   deploy/node_modules/tsx deploy/node_modules/dotenv
+          cp -r node_modules/prisma/. deploy/node_modules/prisma/
+          cp -r node_modules/@prisma/. deploy/node_modules/@prisma/
+          cp -r node_modules/tsx/. deploy/node_modules/tsx/
+          cp -r node_modules/dotenv/. deploy/node_modules/dotenv/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: radx-helpdesk-${{ github.sha }}
+          path: deploy
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  # Deploy to Azure App Service. Only on the default branch. Uses a
+  # federated identity — no publish profile or secret sits in the repo.
+  # ------------------------------------------------------------------
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://helpdesk.radx.co.zw
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: radx-helpdesk-${{ github.sha }}
+          path: deploy
+
+      - name: Sign in to Azure with a federated identity
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to the staging slot
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: radx-helpdesk
+          slot-name: staging
+          package: deploy
+
+      - name: Smoke test the staging slot
+        run: |
+          for _ in {1..30}; do
+            if curl --fail --silent --show-error \
+                 "https://radx-helpdesk-staging.azurewebsites.net/api/health" >/dev/null; then
+              echo "Staging slot is healthy."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Staging slot did not report healthy in 150 seconds." >&2
+          exit 1
+
+      - name: Swap staging → production
+        run: |
+          az webapp deployment slot swap \
+            --resource-group radx-helpdesk \
+            --name radx-helpdesk \
+            --slot staging \
+            --target-slot production

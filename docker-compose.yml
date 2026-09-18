@@ -1,0 +1,75 @@
+# Local development stack for the Radx IT Help Desk.
+#
+#   docker compose up --build
+#
+# Starts the application, a PostgreSQL 16 instance, and a Redis for the shared
+# lockout counters. Migrations and seed run automatically at container start,
+# so the first `up` boots into a working state. Data persists in named
+# volumes; `docker compose down -v` wipes them.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: radx
+      POSTGRES_PASSWORD: radx
+      POSTGRES_DB: radx_helpdesk
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U radx -d radx_helpdesk"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      DATABASE_URL: postgresql://radx:radx@postgres:5432/radx_helpdesk
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: "dev-only-secret-not-for-production-at-least-fifty-characters-long-yes"
+      FIELD_ENCRYPTION_KEY: "R__uKZi3ptmm6mA3n7ynIjRJZk8v8B0AjXPKM5C7v3Y"
+      JOB_TRIGGER_SECRET: "dev-only-job-secret"
+      APP_BASE_URL: "http://localhost:8080"
+      ALLOWED_HOSTS: "localhost,127.0.0.1,app"
+      CSRF_TRUSTED_ORIGINS: "http://localhost:8080"
+      EMAIL_BACKEND: console
+      STORAGE_PROVIDER: local
+      STORAGE_LOCAL_ROOT: /data/storage
+      RADX_SEED_ON_START: "true"
+      LOG_LEVEL: info
+    volumes:
+      - app_storage:/data/storage
+
+volumes:
+  postgres_data:
+  redis_data:
+  app_storage:
